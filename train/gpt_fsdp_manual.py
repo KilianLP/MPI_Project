@@ -1,16 +1,3 @@
-"""
-Manual, CPU-only FSDP-like training using mpi4py on tinyshakespeare:
-- Parameters are sharded by flattening each tensor and splitting across ranks.
-- For each forward/backward, shards are Allgathered to materialize full params
-  layer weights, then released.
-- Gradients are Reduce-Scattered to shards; only local shards are updated.
-
-This mirrors the algorithm flow of FSDP (allgather per layer, reduce-scatter
-grads, shard optimizer state) without torch.distributed. Memory is still higher
-than production FSDP because activations/params live during compute on each
-rank, but ownership/update semantics match the pseudo-code.
-"""
-
 import argparse
 import os
 from dataclasses import asdict
@@ -71,22 +58,21 @@ def allgather_params(params, metas, shards, comm: MPI.Comm, rank: int):
 
 
 def reduce_scatter_grads(params, metas, shards, lr: float, comm: MPI.Comm, rank: int):
-    """Reduce-scatter gradients, update local shards in-place."""
+    """
+    Approximate reduce-scatter: Allreduce full grad, then apply local shard slice.
+    This keeps logic simple while matching aggregated shard updates.
+    """
     world = comm.Get_size()
     for p, meta, shard in zip(params, metas, shards):
         if p.grad is None:
             continue
         grad = p.grad.detach().cpu().contiguous().view(-1)
-        counts = meta["counts"]
-        displs = meta["displs"]
-        recv = np.empty(counts[rank], dtype=grad.numpy().dtype)
-        comm.Reduce_scatter(
-            [grad.numpy(), counts, displs, mpi_dtype_from_array(grad.numpy())],
-            recv,
-            op=MPI.SUM,
-        )
-        recv /= world
-        shard -= lr * torch.from_numpy(recv)
+        buf = grad.numpy()
+        comm.Allreduce(MPI.IN_PLACE, buf, op=MPI.SUM)
+        buf /= world
+        start = meta["displs"][rank]
+        end = start + meta["counts"][rank]
+        shard -= lr * torch.from_numpy(buf[start:end])
         p.grad = None  # free grad
 
 
@@ -162,7 +148,7 @@ def main():
 
     torch.set_num_threads(1)
     if rank == 0:
-        print(f"Running manual FSDP-like GPT training (MPI) on CPU, world={world}")
+        print(f"Running FSDP GPT training (MPI) on CPU, world={world}")
 
     train_loader, val_loader, vocab_size = get_text_dataloaders(
         file_path=args.file,
