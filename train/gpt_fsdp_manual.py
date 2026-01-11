@@ -1,22 +1,23 @@
 """
-Manual, CPU-only FSDP-style training using mpi4py on tinyshakespeare:
-- Parameters assigned to owner ranks (balanced by numel).
-- All ranks run full forward/backward; grads allreduced.
-- Only owners apply optimizer updates; owners broadcast updated params.
+Manual, CPU-only FSDP-like training using mpi4py on tinyshakespeare:
+- Parameters are sharded by flattening each tensor and splitting across ranks.
+- For each forward/backward, shards are Allgathered to materialize full params
+  layer weights, then released.
+- Gradients are Reduce-Scattered to shards; only local shards are updated.
 
-This mirrors the transformer data-parallel setup but with explicit sharded
-updates over MPI. Not memory-optimal (full params on each rank for compute),
-but fully avoids torch.distributed backends.
+This mirrors the algorithm flow of FSDP (allgather per layer, reduce-scatter
+grads, shard optimizer state) without torch.distributed. Memory is still higher
+than production FSDP because activations/params live during compute on each
+rank, but ownership/update semantics match the pseudo-code.
 """
 
 import argparse
 import os
 from dataclasses import asdict
-from typing import List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from mpi4py import MPI
 
@@ -24,110 +25,84 @@ from data.text import get_text_dataloaders
 from models import GPT, GPTConfig
 
 
-def assign_param_owners(params: List[nn.Parameter], world: int) -> List[int]:
-    loads = [0] * world
-    owners = []
+def shard_metadata(p: torch.nn.Parameter, world: int) -> Dict:
+    """Compute shard sizes/offsets for a flattened parameter."""
+    n = p.numel()
+    base = n // world
+    rem = n % world
+    counts = [base + 1 if r < rem else base for r in range(world)]
+    displs = [0]
+    for i in range(1, world):
+        displs.append(displs[i - 1] + counts[i - 1])
+    return {"counts": counts, "displs": displs, "numel": n}
+
+
+def init_shards(params: List[torch.nn.Parameter], rank: int, world: int):
+    """Return per-param shard tensors (on CPU) and metadata."""
+    metas = []
+    shards = []
     for p in params:
-        r = min(range(world), key=lambda i: loads[i])
-        owners.append(r)
-        loads[r] += p.numel()
-    return owners
+        meta = shard_metadata(p, world)
+        start = meta["displs"][rank]
+        end = start + meta["counts"][rank]
+        flat = p.detach().cpu().view(-1)
+        shard = flat[start:end].clone()
+        metas.append(meta)
+        shards.append(shard)
+    return metas, shards
 
 
-def average_gradients(params: List[nn.Parameter], comm: MPI.Comm):
+def mpi_dtype_from_array(arr: np.ndarray):
+    return MPI._typedict[arr.dtype.char]
+
+
+def allgather_params(params, metas, shards, comm: MPI.Comm, rank: int):
+    """Allgather shards to materialize full parameters for compute."""
+    for p, meta, shard in zip(params, metas, shards):
+        counts = meta["counts"]
+        displs = meta["displs"]
+        full = np.empty(meta["numel"], dtype=shard.numpy().dtype)
+        comm.Allgatherv(
+            [shard.numpy(), mpi_dtype_from_array(shard.numpy())],
+            [full, counts, displs, mpi_dtype_from_array(shard.numpy())],
+        )
+        with torch.no_grad():
+            p.data.copy_(torch.from_numpy(full).view_as(p))
+
+
+def reduce_scatter_grads(params, metas, shards, lr: float, comm: MPI.Comm, rank: int):
+    """Reduce-scatter gradients, update local shards in-place."""
     world = comm.Get_size()
-    for p in params:
+    for p, meta, shard in zip(params, metas, shards):
         if p.grad is None:
             continue
-        grad = p.grad.detach()
-        needs_copy_back = False
-        if grad.is_cuda:
-            raise RuntimeError("CPU-only example; use torch.distributed+NCCL for GPU.")
-        if not grad.is_contiguous():
-            grad = grad.contiguous()
-            needs_copy_back = True
-        buf = grad.numpy()
-        comm.Allreduce(MPI.IN_PLACE, buf, op=MPI.SUM)
-        grad.mul_(1.0 / world)
-        if needs_copy_back:
-            p.grad.copy_(grad)
+        grad = p.grad.detach().cpu().contiguous().view(-1)
+        counts = meta["counts"]
+        displs = meta["displs"]
+        recv = np.empty(counts[rank], dtype=grad.numpy().dtype)
+        comm.Reduce_scatter(
+            [grad.numpy(), counts, displs, mpi_dtype_from_array(grad.numpy())],
+            recv,
+            op=MPI.SUM,
+        )
+        recv /= world
+        shard -= lr * torch.from_numpy(recv)
+        p.grad = None  # free grad
 
 
-def broadcast_parameters(params: List[nn.Parameter], owners: List[int], comm: MPI.Comm):
-    for p, owner in zip(params, owners):
-        tensor = p.detach()
-        if tensor.is_cuda:
-            raise RuntimeError("CPU-only example.")
-        buf = tensor.numpy()
-        comm.Bcast(buf, root=owner)
+def reduce_scalar(val: float, comm: MPI.Comm):
+    buf = np.array([val], dtype="float64")
+    comm.Allreduce(MPI.IN_PLACE, buf, op=MPI.SUM)
+    return buf.item() / comm.Get_size()
 
 
-def reduce_scalars(vals: np.ndarray, comm: MPI.Comm):
-    comm.Allreduce(MPI_IN_PLACE := MPI.IN_PLACE, vals, op=MPI.SUM)  # noqa: F841
-    return vals
-
-
-def train_one_epoch(model, train_loader, loss_fn, lr, params, owners, comm, rank, epoch, save_every_steps, save_path, config, optimizer_state):
-    model.train()
-    if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
-        train_loader.sampler.set_epoch(epoch)
-
-    for step, (x, y) in enumerate(train_loader):
-        x = x.to("cpu")
-        y = y.to("cpu")
-
-        model.zero_grad(set_to_none=True)
-        logits = model(x)
-        loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
-        loss.backward()
-
-        average_gradients(params, comm)
-        # Simple SGD update; optimizer_state unused placeholder to mirror checkpoint payload.
-        for p, owner in zip(params, owners):
-            if p.grad is None:
-                continue
-            if rank == owner:
-                p.data.add_(p.grad, alpha=-lr)
-
-        broadcast_parameters(params, owners, comm)
-
-        if step % 100 == 0:
-            loss_avg = reduce_scalars(np.array([loss.item()], dtype="float64"), comm)[0] / comm.Get_size()
-            if rank == 0:
-                print(f"[gpt-fsdp-mpi] epoch={epoch} step={step} loss_avg={loss_avg:.4f}")
-
-        if save_every_steps > 0 and (step + 1) % save_every_steps == 0:
-            save_checkpoint(model, optimizer_state, epoch, step, config, save_path, rank)
-
-
-@torch.no_grad()
-def evaluate(model, loader, loss_fn, comm, rank):
-    model.eval()
-    total_loss = 0.0
-    total_tokens = 0
-
-    for x, y in loader:
-        x = x.to("cpu")
-        y = y.to("cpu")
-        logits = model(x)
-        loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1), reduction="sum")
-        total_loss += loss.item()
-        total_tokens += y.numel()
-
-    metrics = np.array([total_loss, total_tokens], dtype="float64")
-    reduce_scalars(metrics, comm)
-    if rank == 0 and metrics[1] > 0:
-        loss_avg = metrics[0] / metrics[1]
-        ppl = np.exp(loss_avg) if loss_avg < 20 else float("inf")
-        print(f"[gpt-fsdp-mpi] eval_loss={loss_avg:.4f} eval_ppl={ppl:.2f}")
-
-
-def save_checkpoint(model, optimizer_state, epoch, step, config, path, rank):
+def save_checkpoint(model, metas, shards, optimizer_state, epoch, step, config, path, rank, comm):
     if rank != 0:
         return
     dirpath = os.path.dirname(path)
     if dirpath:
         os.makedirs(dirpath, exist_ok=True)
+
     payload = {
         "model_state": model.state_dict(),
         "optimizer_state": optimizer_state,
@@ -139,8 +114,30 @@ def save_checkpoint(model, optimizer_state, epoch, step, config, path, rank):
     print(f"[gpt-fsdp-mpi] saved checkpoint to {path} (epoch {epoch}, step {step})")
 
 
+def evaluate(model, val_loader, comm, rank):
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+    with torch.no_grad():
+        for x, y in val_loader:
+            x = x.to("cpu")
+            y = y.to("cpu")
+            logits = model(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), reduction="sum")
+            total_loss += loss.item()
+            total_tokens += y.numel()
+    metrics = np.array([total_loss, total_tokens], dtype="float64")
+    comm.Allreduce(MPI.IN_PLACE, metrics, op=MPI.SUM)
+    if metrics[1] == 0:
+        return
+    loss_avg = metrics[0] / metrics[1]
+    ppl = np.exp(loss_avg) if loss_avg < 20 else float("inf")
+    if rank == 0:
+        print(f"[gpt-fsdp-mpi] eval_loss={loss_avg:.4f} eval_ppl={ppl:.2f}")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Manual FSDP-style GPT training with mpi4py on tinyshakespeare.")
+    parser = argparse.ArgumentParser(description="Manual FSDP-like GPT training with mpi4py on tinyshakespeare.")
     parser.add_argument("--file", type=str, default=os.path.join("data", "tinyshakespeare.txt"))
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -161,13 +158,11 @@ def main():
     if not os.path.isfile(args.file):
         if rank == 0:
             raise FileNotFoundError(f"Data file not found: {args.file}")
-        else:
-            return
+        return
 
     torch.set_num_threads(1)
-    device = torch.device("cpu")
     if rank == 0:
-        print(f"Running manual FSDP-style GPT training on device={device}, world={world}")
+        print(f"Running manual FSDP-like GPT training (MPI) on CPU, world={world}")
 
     train_loader, val_loader, vocab_size = get_text_dataloaders(
         file_path=args.file,
@@ -187,33 +182,44 @@ def main():
     )
 
     torch.manual_seed(42 + rank)
-    model = GPT(config).to(device)
+    model = GPT(config).to("cpu")
     params = list(model.parameters())
-    owners = assign_param_owners(params, world)
+    metas, shards = init_shards(params, rank, world)
 
-    broadcast_parameters(params, owners, comm)
-
-    loss_fn = F.cross_entropy
-    optimizer_state = {}  # placeholder for symmetry with saved payload
+    # Initial materialization for first forward
+    allgather_params(params, metas, shards, comm, rank)
 
     for epoch in range(args.epochs):
-        train_one_epoch(
-            model=model,
-            train_loader=train_loader,
-            loss_fn=loss_fn,
-            lr=args.lr,
-            params=params,
-            owners=owners,
-            comm=comm,
-            rank=rank,
-            epoch=epoch,
-            save_every_steps=args.save_every_steps,
-            save_path=args.save_path,
-            config=config,
-            optimizer_state=optimizer_state,
-        )
-        evaluate(model, val_loader, loss_fn, comm, rank)
-        save_checkpoint(model, optimizer_state, epoch, -1, config, args.save_path, rank)
+        model.train()
+        if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
+            train_loader.sampler.set_epoch(epoch)
+
+        for step, (x, y) in enumerate(train_loader):
+            # Materialize params for this step
+            allgather_params(params, metas, shards, comm, rank)
+
+            x = x.to("cpu")
+            y = y.to("cpu")
+
+            model.zero_grad(set_to_none=True)
+            logits = model(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+            loss.backward()
+
+            reduce_scatter_grads(params, metas, shards, args.lr, comm, rank)
+
+            if step % 100 == 0:
+                loss_avg = reduce_scalar(loss.item(), comm)
+                if rank == 0:
+                    print(f"[gpt-fsdp-mpi] epoch={epoch} step={step} loss_avg={loss_avg:.4f}")
+
+            if args.save_every_steps > 0 and (step + 1) % args.save_every_steps == 0:
+                allgather_params(params, metas, shards, comm, rank)
+                save_checkpoint(model, metas, shards, {}, epoch, step, config, args.save_path, rank, comm)
+
+        allgather_params(params, metas, shards, comm, rank)
+        evaluate(model, val_loader, comm, rank)
+        save_checkpoint(model, metas, shards, {}, epoch, -1, config, args.save_path, rank, comm)
 
     comm.Barrier()
     if rank == 0:
