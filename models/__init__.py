@@ -1,1 +1,1 @@
-from .mnist_cnn import MnistCNN
+from .gpt import GPT, GPTConfig

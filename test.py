@@ -1,4 +1,4 @@
-from train.mnist_mpi import main
+from train.gpt_mpi import main
 
 
 if __name__ == "__main__":
