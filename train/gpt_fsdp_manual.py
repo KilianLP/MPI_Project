@@ -6,6 +6,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+# i used MPI here
 from mpi4py import MPI
 
 from data.text import get_text_dataloaders
@@ -49,7 +50,7 @@ def allgather_params(params, metas, shards, comm: MPI.Comm, rank: int):
         counts = meta["counts"]
         displs = meta["displs"]
         full = np.empty(meta["numel"], dtype=shard.numpy().dtype)
-        comm.Allgatherv(
+        comm.Allgatherv(  # i used MPI here
             [shard.numpy(), mpi_dtype_from_array(shard.numpy())],
             [full, counts, displs, mpi_dtype_from_array(shard.numpy())],
         )
@@ -68,7 +69,7 @@ def reduce_scatter_grads(params, metas, shards, lr: float, comm: MPI.Comm, rank:
             continue
         grad = p.grad.detach().cpu().contiguous().view(-1)
         buf = grad.numpy()
-        comm.Allreduce(MPI.IN_PLACE, buf, op=MPI.SUM)
+        comm.Allreduce(MPI.IN_PLACE, buf, op=MPI.SUM)  # i used MPI here
         buf /= world
         start = meta["displs"][rank]
         end = start + meta["counts"][rank]
@@ -78,7 +79,7 @@ def reduce_scatter_grads(params, metas, shards, lr: float, comm: MPI.Comm, rank:
 
 def reduce_scalar(val: float, comm: MPI.Comm):
     buf = np.array([val], dtype="float64")
-    comm.Allreduce(MPI.IN_PLACE, buf, op=MPI.SUM)
+    comm.Allreduce(MPI.IN_PLACE, buf, op=MPI.SUM)  # i used MPI here
     return buf.item() / comm.Get_size()
 
 
@@ -113,7 +114,7 @@ def evaluate(model, val_loader, comm, rank):
             total_loss += loss.item()
             total_tokens += y.numel()
     metrics = np.array([total_loss, total_tokens], dtype="float64")
-    comm.Allreduce(MPI.IN_PLACE, metrics, op=MPI.SUM)
+    comm.Allreduce(MPI.IN_PLACE, metrics, op=MPI.SUM)  # i used MPI here
     if metrics[1] == 0:
         return
     loss_avg = metrics[0] / metrics[1]

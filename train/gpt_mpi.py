@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
+# i used MPI here
 from mpi4py import MPI
 
 from data.text import get_text_dataloaders
@@ -25,7 +26,7 @@ def average_gradients(model: torch.nn.Module, comm: MPI.Comm):
             grad = grad.contiguous()
             needs_copy_back = True
         buf = grad.numpy()
-        comm.Allreduce(MPI.IN_PLACE, buf, op=MPI.SUM)
+        comm.Allreduce(MPI.IN_PLACE, buf, op=MPI.SUM)  # i used MPI here
         grad.mul_(1.0 / world)
         if needs_copy_back:
             p.grad.copy_(grad)
@@ -37,12 +38,12 @@ def broadcast_parameters(model: torch.nn.Module, comm: MPI.Comm, root: int = 0):
         if tensor.is_cuda:
             raise RuntimeError("CPU-only example.")
         buf = tensor.numpy()
-        comm.Bcast(buf, root=root)
+        comm.Bcast(buf, root=root)  # i used MPI here
 
 
 def reduce_scalar(value: float, comm: MPI.Comm):
     buf = np.array(value, dtype="float64")
-    comm.Allreduce(MPI.IN_PLACE, buf, op=MPI.SUM)
+    comm.Allreduce(MPI.IN_PLACE, buf, op=MPI.SUM)  # i used MPI here
     return buf.item() / comm.Get_size()
 
 
@@ -60,7 +61,7 @@ def evaluate(model, loader, device, comm):
         total_tokens += y.numel()
 
     metrics = np.array([total_loss, total_tokens], dtype="float64")
-    comm.Allreduce(MPI.IN_PLACE, metrics, op=MPI.SUM)
+    comm.Allreduce(MPI.IN_PLACE, metrics, op=MPI.SUM)  # i used MPI here
     if metrics[1] == 0:
         return 0.0
     return metrics[0] / metrics[1]

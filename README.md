@@ -7,6 +7,11 @@ Ce dépôt contient le code du projet **Machine Learning distribué avec MPI**.
 La majorité des détails techniques sont décrits dans le **compte rendu technique** du projet.  
 Veuillez vous référer à ce document pour une description approfondie de l’architecture, des choix méthodologiques et des résultats expérimentaux.
 
+## Commentaire
+
+Toutes les lignes de code utilisant MPI sont annotées avec un court commentaire au-dessus (`# i used MPI here`), afin de faciliter la compréhension de l’utilisation de MPI dans ce projet.
+
+
 ## Installation
 
 Ce projet est développé en **Python**.  
